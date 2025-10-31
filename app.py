@@ -8,10 +8,11 @@ from io import BytesIO
 import tempfile
 
 load_dotenv()
-BOT_TOKEN = os.getenv("8163487098:AAFFhU3-qVEsuWCKuoYseC9QGaUM92M_sc0")
-GEMINI_KEY = os.getenv("AIzaSyA_N4il-qWqay5YjRUeZNU0KiO3PGlbsDg")
-if not BOT_TOKEN or not GEMINI_KEY:
-    raise RuntimeError("Заполни TG_BOT_TOKEN и GEMINI_API_KEY в .env")
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+missing = [n for n,v in [("TG_BOT_TOKEN", BOT_TOKEN), ("GEMINI_API_KEY", GEMINI_KEY)] if not v]
+if missing:
+    raise RuntimeError(f"Missing env: {', '.join(missing)}")
 
 GEM_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent"
 HEADERS = {"Content-Type": "application/json"}
