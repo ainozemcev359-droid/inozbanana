@@ -8,7 +8,7 @@ from io import BytesIO
 import tempfile
 
 load_dotenv()
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+BOT_TOKEN = os.getenv("8163487098:AAFFhU3-qVEsuWCKuoYseC9QGaUM92M_sc0")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 if not BOT_TOKEN or not GEMINI_KEY:
     raise RuntimeError("Заполни TG_BOT_TOKEN и GEMINI_API_KEY в .env")
