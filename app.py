@@ -18,28 +18,25 @@ if missing:
     raise RuntimeError(f"Missing env: {', '.join(missing)}")
 
 # ---------- MODELS & HTTP ----------
-PRIMARY_MODEL = "gemini-2.5-flash-image"
-FALLBACK_MODEL = "gemini-2.0-flash-exp"  # часто доступна в AI Studio
+PRIMARY_MODEL = "gemini-2.0-flash-exp"      # чаще доступна, умеет IMAGE
+SECONDARY_MODEL = "gemini-2.5-flash-image"  # пробуем следом
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 HEADERS = {"Content-Type": "application/json"}
 
 # ---------- MIME / IMAGE ----------
 def _ensure_image_and_mime(image_bytes: bytes) -> Tuple[bytes, str]:
-    """ Возвращает (байты, mime), согласованные с реальным форматом. """
     im = Image.open(BytesIO(image_bytes))
     fmt = (im.format or "").upper()
     if fmt in ("JPEG", "JPG"):
         return image_bytes, "image/jpeg"
     if fmt == "PNG":
         return image_bytes, "image/png"
-    # Прочее — конвертируем в PNG, сохраняя альфу если есть
     buf = BytesIO()
     (im if im.mode in ("RGBA", "LA") else im.convert("RGB")).save(buf, format="PNG")
     return buf.getvalue(), "image/png"
 
-def _parts(prompt: str, mime: str, b64data: str):
-    """ Базовое содержимое parts без роли (вариант 1/2). """
-    return [{
+def _parts(prompt: str, mime: str, b64data: str, with_role: bool):
+    base = {
         "parts": [
             {"text": (
                 "Отредактируй изображение строго по инструкции. "
@@ -49,96 +46,79 @@ def _parts(prompt: str, mime: str, b64data: str):
             )},
             {"inline_data": {"mime_type": mime, "data": b64data}}
         ]
-    }]
+    }
+    if with_role:
+        base["role"] = "user"
+    return [base]
 
-def _parts_with_role(prompt: str, mime: str, b64data: str):
-    """ То же, но с явной ролью (вариант 2). """
-    return [{
-        "role": "user",
-        "parts": [
-            {"text": (
-                "Отредактируй изображение строго по инструкции. "
-                "Сохрани стиль исходного текста (шрифт, размер, цвет, выравнивание, трекинг). "
-                "Не изменяй остальные области изображения. "
-                "Инструкция: " + prompt
-            )},
-            {"inline_data": {"mime_type": mime, "data": b64data}}
-        ]
-    }]
+def _extract_image_b64(data: dict) -> str:
+    """
+    Возвращает base64-данные картинки из ответа Gemini.
+    Бросает RuntimeError с кратким содержанием, если в ответе не картинка.
+    """
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        for p in parts:
+            if "inline_data" in p and p["inline_data"].get("data"):
+                return p["inline_data"]["data"]
+        # Если дошли сюда — модель ответила не картинкой (например, текстом с ошибкой)
+        short = json.dumps(parts, ensure_ascii=False)[:400]
+        raise RuntimeError(f"Модель вернула не изображение: {short}")
+    except Exception as e:
+        raise RuntimeError(f"Не удалось извлечь изображение из ответа: {e}")
 
 async def _post_model(model: str, payload: dict) -> dict:
     async with httpx.AsyncClient(timeout=180) as client:
         url = f"{API_ROOT}/models/{model}:generateContent?key={GEMINI_KEY}"
         r = await client.post(url, headers=HEADERS, json=payload)
-        # Для диагностики: если 4xx, вытащим текст
         if r.status_code >= 400:
-            try:
-                print("GEMINI ERROR BODY:", r.text[:2000])
-            except Exception:
-                pass
+            # логируем тело, чтобы видеть причину
+            print("GEMINI ERROR BODY:", r.text[:2000])
         r.raise_for_status()
         return r.json()
 
 async def gemini_edit(prompt: str, image_bytes: bytes) -> bytes:
-    """
-    Многоступенчатая попытка вызова Gemini:
-    1) 2.5-flash-image + generationConfig.responseMimeType="image/png"
-    2) то же + role=user
-    3) то же, но БЕЗ generationConfig, c responseModalities=["IMAGE"]
-    4) fallback-модель 2.0-flash-exp с (1)
-    """
     img1, mime1 = _ensure_image_and_mime(image_bytes)
     b64_1 = base64.b64encode(img1).decode()
 
-    # --- Вариант 1: без роли, с generationConfig ---
+    # --- Попытка 1: PRIMARY_MODEL + responseModalities=["IMAGE"], с ролью user ---
     payload1 = {
-        "contents": _parts(prompt, mime1, b64_1),
-        "generationConfig": {"responseMimeType": "image/png"},
-    }
-    try:
-        data = await _post_model(PRIMARY_MODEL, payload1)
-        b64 = data["candidates"][0]["content"]["parts"][0]["inline_data"]["data"]
-        return base64.b64decode(b64)
-    except httpx.HTTPStatusError as e1:
-        if e1.response is None or e1.response.status_code != 400:
-            raise
-
-    # --- Вариант 2: добавляем role="user" ---
-    payload2 = {
-        "contents": _parts_with_role(prompt, mime1, b64_1),
-        "generationConfig": {"responseMimeType": "image/png"},
-    }
-    try:
-        data = await _post_model(PRIMARY_MODEL, payload2)
-        b64 = data["candidates"][0]["content"]["parts"][0]["inline_data"]["data"]
-        return base64.b64decode(b64)
-    except httpx.HTTPStatusError as e2:
-        if e2.response is None or e2.response.status_code != 400:
-            raise
-
-    # --- Вариант 3: без generationConfig, но с responseModalities=["IMAGE"] ---
-    payload3 = {
-        "contents": _parts_with_role(prompt, mime1, b64_1),
+        "contents": _parts(prompt, mime1, b64_1, with_role=True),
         "responseModalities": ["IMAGE"]
     }
     try:
-        data = await _post_model(PRIMARY_MODEL, payload3)
-        b64 = data["candidates"][0]["content"]["parts"][0]["inline_data"]["data"]
+        data = await _post_model(PRIMARY_MODEL, payload1)
+        b64 = _extract_image_b64(data)
         return base64.b64decode(b64)
-    except httpx.HTTPStatusError as e3:
-        if e3.response is None or e3.response.status_code != 400:
+    except httpx.HTTPStatusError as e:
+        if not (e.response is not None and e.response.status_code == 400):
             raise
 
-    # --- Вариант 4: fallback-модель ---
+    # --- Попытка 2: SECONDARY_MODEL + responseModalities=["IMAGE"], с ролью user ---
+    payload2 = {
+        "contents": _parts(prompt, mime1, b64_1, with_role=True),
+        "responseModalities": ["IMAGE"]
+    }
     try:
-        data = await _post_model(FALLBACK_MODEL, payload1)
-        b64 = data["candidates"][0]["content"]["parts"][0]["inline_data"]["data"]
+        data = await _post_model(SECONDARY_MODEL, payload2)
+        b64 = _extract_image_b64(data)
         return base64.b64decode(b64)
-    except httpx.HTTPStatusError as e4:
-        # Дадим пользователю короткое тело ошибки, чтобы не было «просто 400»
+    except httpx.HTTPStatusError as e2:
+        if not (e2.response is not None and e2.response.status_code == 400):
+            raise
+
+    # --- Попытка 3: SECONDARY_MODEL без responseModalities (некоторые конфиги так отвечают картинкой) ---
+    payload3 = {
+        "contents": _parts(prompt, mime1, b64_1, with_role=True)
+    }
+    try:
+        data = await _post_model(SECONDARY_MODEL, payload3)
+        b64 = _extract_image_b64(data)
+        return base64.b64decode(b64)
+    except httpx.HTTPStatusError as e3:
         body = ""
         try:
-            body = e4.response.text[:400]
+            body = e3.response.text[:400]
         except Exception:
             pass
         raise RuntimeError(f"Gemini 400: {body or 'Bad Request'}")
